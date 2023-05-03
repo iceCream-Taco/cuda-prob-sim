@@ -1,121 +1,194 @@
-﻿
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
+﻿#include <curand_kernel.h>
 
-#include <stdio.h>
+#include <iostream>
+#include <cuda_profiler_api.h>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+#define HEADS true
+#define TAILS false
 
-__global__ void addKernel(int *c, const int *a, const int *b)
+#define CUDA(x) { gpuAssert((x), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
 }
 
-int main()
+// TODO add CURAND checking
+
+__global__ void random_to_tosses(const float* source, bool* dest, int N)
 {
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
-
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
-
-    return 0;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i > N) return; // only needed if threads*blocks is not a multiple of N // TODO
+    
+    dest[i] = source[i] >= 0.5;
 }
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+__global__ void find_targets(const bool* tosses, int* dest, int N)
 {
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x + 3;
+    if (i > N - 3) return; // only needed if threads*blocks is not a multiple of N // TODO
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
+    // >= 3 heads, followed by 3 tails
+    if (tosses[i - 3] == HEADS && tosses[i - 2] == HEADS && tosses[i - 1] == HEADS
+        && tosses[i] == TAILS && tosses[i + 1] == TAILS && tosses[i + 2] == TAILS) {
+
+        // automatically take the known steps
+        dest[i - 3] = -3;
+        dest[i + 2] = 2;
+    }
+}
+
+__device__ bool allThreadsDone;
+__global__ void find_dists(bool* is_done, int* old_dist, int* new_dist, int N)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i > N) return;
+
+    int dist = old_dist[i];
+
+    if (dist == 0) {
+        new_dist[i] = 0;
+        return;
     }
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
+    bool propagated = false;
+    bool completed = false;
+
+    // if the (right) neighbour is in range
+    if (is_done[i]) {
+        new_dist[i] = dist;
+    } else if (dist > 0 && i < N - 1) {
+        // if the 1st/2nd neighbour is populated, then place result in new_dist
+        if (old_dist[i + 1] < 0) {
+            new_dist[i] = 2 * dist + 1;
+            new_dist[i + 1] = 0;
+            completed = true;
+        } else if (i < N - 2 && old_dist[i + 2] < 0) {
+            new_dist[i] = 2 * dist + 2;
+            new_dist[i + 2] = 0;
+            completed = true;
+        } else {
+            new_dist[i + 1] = dist + 1;
+            new_dist[i] = 0;
+            propagated = true;
+        }
+    // if there are no (left) neighbour in range
+    } else if (dist < 0 && i > 1 && old_dist[i - 1] == 0 && i < N - 2 && old_dist[i - 2] == 0) {
+        new_dist[i - 1] = dist - 1;
+        new_dist[i] = 0;
+        propagated = true;
     }
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+    is_done[i] = is_done[i] || completed;
+    allThreadsDone = !(completed || propagated);
+}
 
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+// blocks and threads must be power of two
+/*_device__ int filtered;
+__global__ void reduce_sparse(const int* input, int* output, int N)
+{
+    __shared__ int block_data[];
 
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
+    if (i < N && input[i] != 0) {
+        output[atomicAdd(filtered, 1)] = input[i];
     }
+}*/
 
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
+int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
+    // TODO: Process overlapping chunks i.e. for 1,000,000 'flips', where we want 4 heads, 3 tails
+    // TODO: we would need 7 to consider if this condition is met, so for 0-7, 1-8, 2-9, ..., 999 993 - 1 000 000
+    // TODO: Check if this condition is met, then return this in another array
+    // TODO: Then this just needs to be counted as a 1 or 0, this can probably be combined with the last step
+    // TODO: Using a similar approach to the histogram
 
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
+    int N = 1 << 24;
+
+    float* tossSource;
+    bool* tosses;
+    int* targets;
+    int* intermediate;
+    bool* tracker; // todo place in device code
+    // int* reduced;
+
+    // assign memory required
+    CUDA(cudaMalloc(&tossSource, N * sizeof(float)));
+    CUDA(cudaMalloc(&tosses, N * sizeof(bool)));
+    CUDA(cudaMallocManaged(&targets, N * sizeof(int)));
+    CUDA(cudaMallocManaged(&intermediate, N * sizeof(int)));
+    CUDA(cudaMalloc(&tracker, N * sizeof(bool)));
+    // CUDA(cudaMallocManaged(&reduced, N * sizeof(int)));
+
+    bool initialValue = false;
+    CUDA(cudaMemcpyToSymbol(allThreadsDone, &initialValue, sizeof(bool))); // TODO test in-place assignment
+
+    // create the RNG
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, (unsigned long long int) clock());
+
+    // generate random numbers 0-1
+    curandGenerateUniform(gen, tossSource, N);
+
+    // convert the floats to booleans representing coin flips
+    random_to_tosses<<<N, 1>>>(tossSource, tosses, N); // TODO optimise grid/block settings
+    CUDA(cudaPeekAtLastError());
+
+    // mark all the locations of the desired >=3 heads, 3 tails pattern with a 1 in an 0-filled array
+    CUDA(cudaMemset(targets, 0, N * sizeof(int))); 
+    find_targets<<<N, 1>>>(tosses, targets, N);
+    CUDA(cudaPeekAtLastError());
+
+    // find the distances between the marked locations
+    CUDA(cudaMemset(tracker, false, N * sizeof(bool)));
+    bool allThreadsDoneHost;
+
+    do {
+        find_dists<<<N, 1 >>> (tracker, targets, intermediate, N);
+        CUDA(cudaPeekAtLastError());
+
+        CUDA(cudaMemcpyFromSymbol(&allThreadsDoneHost, allThreadsDone, sizeof(bool)));
+
+        int* swap = targets;
+        targets = intermediate;
+        intermediate = swap;
+    } while (!allThreadsDoneHost); // TODO turn into while loop on GPU
+
+    // reduce targets to a smaller array of distances with 0s eliminated
+    //reduce_sparse<<<(N + 255) / 256, 256>>>(targets, reduced, N); // TODO further reduction
+
+    // wait for all calculations to stop
+    CUDA(cudaDeviceSynchronize());
+
+    // find average
+    double average = 0.0f;
+    int count = 0;
+    for (int i = 0; i < N; i++) {
+        if (targets[i] != 0) {
+            average += targets[i];
+            count++;
+        }
     }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
+    printf("Avg: %f\n", average / count);
 
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+    // free all used memory
+    CUDA(cudaFree(tossSource));
+    CUDA(cudaFree(tosses));
+    CUDA(cudaFree(targets));
+    CUDA(cudaFree(intermediate));
+    CUDA(cudaFree(tracker));
+    // CUDA(cudaFree(reduced));
 
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+    // flush profiling
+    cudaProfilerStop();
+
+    // exit
+    return EXIT_SUCCESS;
+
+    //    int blockSize = 256; // threads per block
+    //    int numBlocks = (N + blockSize - 1) / blockSize; // blocks needed to compute all values
+    //    add<<<numBlocks, blockSize>>>(N, x, y);
 }
