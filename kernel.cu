@@ -15,8 +15,6 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
     }
 }
 
-// TODO add CURAND checking
-
 __global__ void random_to_tosses(const float* source, bool* dest, int N)
 {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -85,34 +83,14 @@ __global__ void find_dists(bool* is_done, int* old_dist, int* new_dist, int N)
     allThreadsDone = !(completed || propagated);
 }
 
-// blocks and threads must be power of two
-/*_device__ int filtered;
-__global__ void reduce_sparse(const int* input, int* output, int N)
-{
-    __shared__ int block_data[];
-
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < N && input[i] != 0) {
-        output[atomicAdd(filtered, 1)] = input[i];
-    }
-}*/
-
-int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
-    // TODO: Process overlapping chunks i.e. for 1,000,000 'flips', where we want 4 heads, 3 tails
-    // TODO: we would need 7 to consider if this condition is met, so for 0-7, 1-8, 2-9, ..., 999 993 - 1 000 000
-    // TODO: Check if this condition is met, then return this in another array
-    // TODO: Then this just needs to be counted as a 1 or 0, this can probably be combined with the last step
-    // TODO: Using a similar approach to the histogram
-
+int main() {
     int N = 1 << 24;
 
     float* tossSource;
     bool* tosses;
     int* targets;
     int* intermediate;
-    bool* tracker; // todo place in device code
-    // int* reduced;
+    bool* tracker;
 
     // assign memory required
     CUDA(cudaMalloc(&tossSource, N * sizeof(float)));
@@ -120,10 +98,9 @@ int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
     CUDA(cudaMallocManaged(&targets, N * sizeof(int)));
     CUDA(cudaMallocManaged(&intermediate, N * sizeof(int)));
     CUDA(cudaMalloc(&tracker, N * sizeof(bool)));
-    // CUDA(cudaMallocManaged(&reduced, N * sizeof(int)));
 
     bool initialValue = false;
-    CUDA(cudaMemcpyToSymbol(allThreadsDone, &initialValue, sizeof(bool))); // TODO test in-place assignment
+    CUDA(cudaMemcpyToSymbol(allThreadsDone, &initialValue, sizeof(bool)));
 
     // create the RNG
     curandGenerator_t gen;
@@ -134,7 +111,7 @@ int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
     curandGenerateUniform(gen, tossSource, N);
 
     // convert the floats to booleans representing coin flips
-    random_to_tosses<<<N, 1>>>(tossSource, tosses, N); // TODO optimise grid/block settings
+    random_to_tosses<<<N, 1>>>(tossSource, tosses, N);
     CUDA(cudaPeekAtLastError());
 
     // mark all the locations of the desired >=3 heads, 3 tails pattern with a 1 in an 0-filled array
@@ -155,10 +132,7 @@ int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
         int* swap = targets;
         targets = intermediate;
         intermediate = swap;
-    } while (!allThreadsDoneHost); // TODO turn into while loop on GPU
-
-    // reduce targets to a smaller array of distances with 0s eliminated
-    //reduce_sparse<<<(N + 255) / 256, 256>>>(targets, reduced, N); // TODO further reduction
+    } while (!allThreadsDoneHost);
 
     // wait for all calculations to stop
     CUDA(cudaDeviceSynchronize());
@@ -180,15 +154,10 @@ int main() { // TODO add CUDA_CALL/CURAND_CALL error checking macros
     CUDA(cudaFree(targets));
     CUDA(cudaFree(intermediate));
     CUDA(cudaFree(tracker));
-    // CUDA(cudaFree(reduced));
 
     // flush profiling
     cudaProfilerStop();
 
     // exit
     return EXIT_SUCCESS;
-
-    //    int blockSize = 256; // threads per block
-    //    int numBlocks = (N + blockSize - 1) / blockSize; // blocks needed to compute all values
-    //    add<<<numBlocks, blockSize>>>(N, x, y);
 }
